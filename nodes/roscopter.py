@@ -65,7 +65,7 @@ def send_rc(data):
 
 def set_arm(req):
     master.arducopter_arm()
-    return True
+    # return True
 
 def set_disarm(req):
     master.arducopter_disarm()
@@ -153,6 +153,8 @@ print("Sending all stream request for rate %u" % opts.rate)
 
 master.mav.request_data_stream_send(master.target_system, master.target_component,
                                     mavutil.mavlink.MAV_DATA_STREAM_ALL, opts.rate, 1)
+master.arducopter_arm()
+
 
 #master.mav.set_mode_send(master.target_system, 
 if __name__ == '__main__':
