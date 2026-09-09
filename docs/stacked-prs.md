@@ -44,3 +44,11 @@ Wait for checks and existing merge authorization. Verify the exact target and it
 The policy bundle and enrollment helper live at `~/.codex/stack-policy` on the configured Codex host. The helper audits before applying and saves original branch protection and repository file contents. Roll back protection with its `rollback --repo OWNER/REPO` command; revert the setup PR through a new PR to remove committed policy. Rollback does not reset developer branches or undo unrelated repository settings.
 
 GitHub may change its public-preview stack APIs. A failing validation must be investigated, not silently bypassed. Repository owners can deliberately change GitHub settings; these controls govern normal contribution and merge paths, not owner authority.
+
+<!-- codex-review-gate:start -->
+## Codex review completion
+
+The required `Stack policy` check blocks while Codex's authenticated summary reports a running, failed, or unknown review, while a new `@codex review` / `@codex security review` request awaits completion, or while an active bot eyes reaction has no later completion. Every code and security review must finish. Completed findings are advisory: maintainers may choose to ignore them. Retry a failed review; do not bypass an unfinished review.
+
+PR and comment events update the check. Manually dispatch the controller if a legacy reaction-only review does not emit a summary event. GitHub event delivery is asynchronous, leaving a brief detection window when a new review starts. No review is required when none is requested or active. This does not require a fresh review of every push. Existing stack, CI, and review requirements still apply. The controller only reads GitHub metadata and never executes PR code.
+<!-- codex-review-gate:end -->

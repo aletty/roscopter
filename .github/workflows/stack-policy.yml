@@ -3,6 +3,8 @@ name: Stack policy controller
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, edited, closed, ready_for_review, converted_to_draft, stacked, unstacked]
+  issue_comment:
+    types: [created, edited, deleted]
   push:
     branches: ["master"]
   delete:
@@ -10,6 +12,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  issues: read
   checks: write
 concurrency:
   group: stack-policy-reconcile
@@ -17,13 +20,14 @@ concurrency:
 jobs:
   reconcile:
     name: Reconcile stack policy
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           script: |
-            // Stack policy v1. Trusted metadata only; never executes pull request code.
+            // Stack policy v2: wait for Codex review completion. Trusted metadata only; never executes pull request code.
             'use strict';
             
             function dependency(body) {
@@ -33,6 +37,30 @@ jobs:
               const match = lines[0].trim().match(/^Depends on:\s*(none|#[1-9]\d*)\s*$/i);
               if (!match) throw new Error('Dependency must be none or one immediate parent PR number, e.g. #123.');
               return match[1].toLowerCase() === 'none' ? null : Number(match[1].slice(1));
+            }
+            
+            const CODEX_BOT = 'chatgpt-codex-connector[bot]';
+            const SUMMARY_MARKER = '<!-- codex-pull-request-review-summary -->';
+            function codexReview(comments, reactions) {
+              const summaries = comments.filter(c => c.user?.login === CODEX_BOT && c.user?.type === 'Bot' && c.body?.includes(SUMMARY_MARKER));
+              // Read only the status column, never explanatory text or findings.
+              for (const summary of summaries) {
+                const rows = summary.body.split(/\r?\n/).filter(line => /^\|/.test(line) && /\*\*(?:Code Review|Security Review)\*\*/i.test(line));
+                if (!rows.length) return {ok:false, message:'Codex review status is unrecognized; wait for a valid completion summary.'};
+                for (const row of rows) {
+                  const status = row.split('|')[2] || '';
+                  if (!/\*\*Completed\*\*/i.test(status))
+                    return {ok:false, message:'Codex review has not completed. Wait for its response; retry a failed review.'};
+                }
+              }
+              const completedAt = Math.max(0, ...summaries.map(c => Date.parse(c.updated_at) || 0));
+              const requests = comments.filter(c => /^\s*@codex\s+(?:security\s+)?review\b/im.test(c.body || ''));
+              if (requests.some(c => (Date.parse(c.created_at) || Infinity) > completedAt))
+                return {ok:false, message:'A Codex review was requested; waiting for the bot completion summary.'};
+              const eyes = reactions.filter(r => r.user?.login === CODEX_BOT && r.user?.type === 'Bot' && r.content === 'eyes');
+              if (eyes.some(r => !completedAt || (Date.parse(r.created_at) || Infinity) > completedAt))
+                return {ok:false, message:'Codex is reviewing (eyes reaction); wait for completion.'};
+              return {ok:true, message:summaries.length ? 'Codex review completed; findings are advisory.' : 'No active Codex review detected.'};
             }
             
             function validate(snapshot) {
@@ -87,6 +115,8 @@ jobs:
                     if (!stack || !(membership.get(child.number) || []).some(s => s.number === stack.number))
                       throw new Error(`Dependent PR #${child.number} is not linked into the same native stack.`);
                   }
+                  const review = snapshot.codex?.[p.number];
+                  if (review && !review.ok) throw new Error(review.message);
                   results.set(p.number, {ok:true, message: parent?.merged_at ? 'Parent merged; this layer now targets trunk.' : 'Dependency and native stack structure verified.'});
                 } catch (error) { results.set(p.number, {ok:false, message:error.message}); }
               }
@@ -132,10 +162,16 @@ jobs:
                     }
                   }
                 }
-                return {repository, defaultBranch:repositoryData.default_branch, pulls, stacks, ancestors:{}};
+                const codex = {};
+                for (const p of open) {
+                  const comments = await github.paginate(github.rest.issues.listComments, {...args, issue_number:p.number, per_page:100});
+                  const reactions = await github.paginate(github.rest.reactions.listForIssue, {...args, issue_number:p.number, per_page:100});
+                  codex[p.number] = codexReview(comments, reactions);
+                }
+                return {repository, defaultBranch:repositoryData.default_branch, pulls, stacks, ancestors:{}, codex};
               }
               function fingerprint(s) {
-                return JSON.stringify({defaultBranch:s.defaultBranch,
+                return JSON.stringify({defaultBranch:s.defaultBranch, codex:s.codex,
                   pulls:s.pulls.map(p => ({number:p.number, state:p.state, merged_at:p.merged_at, body:p.body,
                     head:[p.head.ref,p.head.sha,p.head.repo?.full_name],base:[p.base.ref,p.base.sha,p.base.repo?.full_name],stack:p.stack})).sort((a,b)=>a.number-b.number),
                   stacks:s.stacks.filter(s=>s.open).map(s=>({number:s.number,base:s.base,prs:s.pull_requests.map(p=>[p.number,p.state,p.head.sha])})).sort((a,b)=>a.number-b.number)});

@@ -1,0 +1,197 @@
+// Stack policy v2: wait for Codex review completion. Trusted metadata only; never executes pull request code.
+'use strict';
+
+function dependency(body) {
+  const clean = (body || '').replace(/<!--[\s\S]*?-->/g, '').replace(/```[\s\S]*?```/g, '');
+  const lines = clean.split(/\r?\n/).filter(x => /^Depends on:/i.test(x.trim()));
+  if (lines.length !== 1) throw new Error('Include exactly one line: Depends on: none or Depends on: #123.');
+  const match = lines[0].trim().match(/^Depends on:\s*(none|#[1-9]\d*)\s*$/i);
+  if (!match) throw new Error('Dependency must be none or one immediate parent PR number, e.g. #123.');
+  return match[1].toLowerCase() === 'none' ? null : Number(match[1].slice(1));
+}
+
+const CODEX_BOT = 'chatgpt-codex-connector[bot]';
+const SUMMARY_MARKER = '<!-- codex-pull-request-review-summary -->';
+function codexReview(comments, reactions) {
+  const summaries = comments.filter(c => c.user?.login === CODEX_BOT && c.user?.type === 'Bot' && c.body?.includes(SUMMARY_MARKER));
+  // Read only the status column, never explanatory text or findings.
+  for (const summary of summaries) {
+    const rows = summary.body.split(/\r?\n/).filter(line => /^\|/.test(line) && /\*\*(?:Code Review|Security Review)\*\*/i.test(line));
+    if (!rows.length) return {ok:false, message:'Codex review status is unrecognized; wait for a valid completion summary.'};
+    for (const row of rows) {
+      const status = row.split('|')[2] || '';
+      if (!/\*\*Completed\*\*/i.test(status))
+        return {ok:false, message:'Codex review has not completed. Wait for its response; retry a failed review.'};
+    }
+  }
+  const completedAt = Math.max(0, ...summaries.map(c => Date.parse(c.updated_at) || 0));
+  const requests = comments.filter(c => /^\s*@codex\s+(?:security\s+)?review\b/im.test(c.body || ''));
+  if (requests.some(c => (Date.parse(c.created_at) || Infinity) > completedAt))
+    return {ok:false, message:'A Codex review was requested; waiting for the bot completion summary.'};
+  const eyes = reactions.filter(r => r.user?.login === CODEX_BOT && r.user?.type === 'Bot' && r.content === 'eyes');
+  if (eyes.some(r => !completedAt || (Date.parse(r.created_at) || Infinity) > completedAt))
+    return {ok:false, message:'Codex is reviewing (eyes reaction); wait for completion.'};
+  return {ok:true, message:summaries.length ? 'Codex review completed; findings are advisory.' : 'No active Codex review detected.'};
+}
+
+function validate(snapshot) {
+  const {pulls, stacks, defaultBranch, repository, ancestors} = snapshot;
+  const byNumber = new Map(pulls.map(p => [p.number, p]));
+  const results = new Map();
+  const activeStacks = stacks.filter(s => s.open);
+  const membership = new Map();
+  for (const stack of activeStacks) {
+    for (const entry of stack.pull_requests) {
+      const list = membership.get(entry.number) || [];
+      list.push(stack); membership.set(entry.number, list);
+    }
+  }
+  for (const p of pulls.filter(p => p.state === 'open')) {
+    try {
+      const dep = dependency(p.body);
+      const memberships = membership.get(p.number) || [];
+      if (memberships.length > 1) throw new Error('PR belongs to multiple active stacks.');
+      const stack = memberships[0];
+      if (!!p.stack !== !!stack || (stack && p.stack.number !== stack.number))
+        throw new Error('Native stack metadata is inconsistent; resubmit/sync and rerun.');
+      if (stack && stack.base.ref !== defaultBranch) throw new Error('Stack must target the repository default branch.');
+      let expected = null;
+      if (stack) {
+        const active = stack.pull_requests.filter(e => e.state === 'open');
+        const index = active.findIndex(e => e.number === p.number);
+        if (index < 0) throw new Error('PR missing from native stack order.');
+        expected = index > 0 ? active[index - 1].number : null;
+        if (p.head.repo?.full_name !== repository) throw new Error('Native stack branches must be in this repository.');
+      }
+      const parent = dep === null ? null : byNumber.get(dep);
+      if (dep !== null && !parent) throw new Error(`Parent #${dep} is missing or inaccessible.`);
+      if (dep === p.number) throw new Error('A PR cannot depend on itself.');
+      if (parent && parent.state === 'open') {
+        if (!stack) throw new Error('Dependent PR must be linked into a native GitHub stack.');
+        if (expected !== dep) throw new Error('Declared parent does not match immediate native stack predecessor.');
+        if (parent.head.repo?.full_name !== repository || p.base.ref !== parent.head.ref)
+          throw new Error('PR base must be the immediate parent branch in this repository.');
+        if (!ancestors[`${parent.head.sha}:${p.head.sha}`]) throw new Error('Parent tip is not an ancestor; rebase the stack.');
+      } else {
+        if (expected !== null) throw new Error(`Declare immediate parent #${expected}.`);
+        if (p.base.ref !== defaultBranch) throw new Error('Standalone or bottom PR must target the default branch.');
+        if (parent && (!parent.merged_at || parent.base.ref !== defaultBranch))
+          throw new Error('Closed parent was not merged into the default branch.');
+      }
+      // A parent with an unregistered dependent child must not pass as standalone.
+      const children = pulls.filter(c => c.state === 'open' && c.number !== p.number &&
+        c.base.ref === p.head.ref && c.base.repo?.full_name === repository && p.head.repo?.full_name === repository);
+      if (children.length > 1) throw new Error('Multiple child branches: split into separate linear stacks.');
+      for (const child of children) {
+        if (!stack || !(membership.get(child.number) || []).some(s => s.number === stack.number))
+          throw new Error(`Dependent PR #${child.number} is not linked into the same native stack.`);
+      }
+      const review = snapshot.codex?.[p.number];
+      if (review && !review.ok) throw new Error(review.message);
+      results.set(p.number, {ok:true, message: parent?.merged_at ? 'Parent merged; this layer now targets trunk.' : 'Dependency and native stack structure verified.'});
+    } catch (error) { results.set(p.number, {ok:false, message:error.message}); }
+  }
+  // A broken declaration on a native layer invalidates the whole stack, preventing partial bypass.
+  for (const stack of activeStacks) {
+    const bad = stack.pull_requests.find(e => results.get(e.number)?.ok === false);
+    if (bad) for (const entry of stack.pull_requests) {
+      if (results.get(entry.number)?.ok) results.set(entry.number, {ok:false, message:`Stack layer #${bad.number} fails policy: ${results.get(bad.number).message}`});
+    }
+  }
+  return results;
+}
+
+async function run({github, context, core}) {
+  const {owner, repo} = context.repo;
+  const repository = `${owner}/${repo}`;
+  const headers = {'X-GitHub-Api-Version':'2026-03-10'};
+  const args = {owner, repo, headers};
+  const checks = new Map();
+  const details_url = `${context.serverUrl}/${repository}/actions/runs/${context.runId}`;
+  async function listOpen() { return github.paginate(github.rest.pulls.list, {...args, state:'open', per_page:100}); }
+  async function pending(pulls) {
+    for (const p of pulls) if (!checks.has(p.head.sha)) {
+      const {data} = await github.rest.checks.create({...args, name:'Stack policy', head_sha:p.head.sha,
+        status:'in_progress', details_url, output:{title:'Validating current dependency graph', summary:'Validation is pending; no PR code is executed.'}});
+      checks.set(p.head.sha, data.id);
+    }
+  }
+  async function snapshot(open) {
+    const {data: repositoryData} = await github.rest.repos.get(args);
+    const stacks = await github.paginate('GET /repos/{owner}/{repo}/stacks', {...args, per_page:100});
+    const pulls = [...open];
+    const seen = new Set(pulls.map(p => p.number));
+    for (const p of open) {
+      let dep; try { dep = dependency(p.body); } catch { continue; }
+      if (dep !== null && !seen.has(dep)) {
+        try {
+          const {data} = await github.rest.pulls.get({...args, pull_number:dep});
+          pulls.push(data); seen.add(dep);
+        } catch (error) {
+          if (error.status !== 404) throw error; // A nonexistent parent fails its PR, not unrelated PRs.
+          seen.add(dep);
+        }
+      }
+    }
+    const codex = {};
+    for (const p of open) {
+      const comments = await github.paginate(github.rest.issues.listComments, {...args, issue_number:p.number, per_page:100});
+      const reactions = await github.paginate(github.rest.reactions.listForIssue, {...args, issue_number:p.number, per_page:100});
+      codex[p.number] = codexReview(comments, reactions);
+    }
+    return {repository, defaultBranch:repositoryData.default_branch, pulls, stacks, ancestors:{}, codex};
+  }
+  function fingerprint(s) {
+    return JSON.stringify({defaultBranch:s.defaultBranch, codex:s.codex,
+      pulls:s.pulls.map(p => ({number:p.number, state:p.state, merged_at:p.merged_at, body:p.body,
+        head:[p.head.ref,p.head.sha,p.head.repo?.full_name],base:[p.base.ref,p.base.sha,p.base.repo?.full_name],stack:p.stack})).sort((a,b)=>a.number-b.number),
+      stacks:s.stacks.filter(s=>s.open).map(s=>({number:s.number,base:s.base,prs:s.pull_requests.map(p=>[p.number,p.state,p.head.sha])})).sort((a,b)=>a.number-b.number)});
+  }
+  try {
+    // Invalidate old success before querying stacks or ancestors. Failed API calls leave failures.
+    if (context.payload.pull_request?.head?.sha) await pending([context.payload.pull_request]);
+    let open = await listOpen();
+    await pending(open);
+    let stable, results;
+    for (let attempt=0; attempt<3; attempt++) {
+      const before = await snapshot(open);
+      for (const p of open) {
+        let dep; try { dep=dependency(p.body); } catch { continue; }
+        const parent = before.pulls.find(q=>q.number===dep && q.state==='open');
+        if (parent && parent.number !== p.number && parent.head.repo?.full_name === repository &&
+            p.head.repo?.full_name === repository && p.base.ref === parent.head.ref) {
+          const {data} = await github.rest.repos.compareCommitsWithBasehead({...args, basehead:`${parent.head.sha}...${p.head.sha}`});
+          before.ancestors[`${parent.head.sha}:${p.head.sha}`] = data.merge_base_commit.sha === parent.head.sha;
+        }
+      }
+      results = validate(before);
+      open = await listOpen(); await pending(open);
+      const after = await snapshot(open);
+      if (fingerprint(before) === fingerprint(after)) { stable=after; break; }
+    }
+    if (!stable) throw new Error('Dependency graph changed repeatedly during validation; rerun when stable.');
+    const rows=[];
+    for (const [sha,id] of checks) {
+      // Re-read all dependency metadata before issuing any success for this SHA.
+      const fresh = await snapshot(await listOpen());
+      if (fingerprint(stable) !== fingerprint(fresh)) throw new Error('PR metadata changed before publication; rerun required.');
+      const prs = stable.pulls.filter(p=>p.state==='open' && p.head.sha===sha);
+      const bad = prs.filter(p=>!results.get(p.number)?.ok);
+      const summary = prs.map(p=>`#${p.number}: ${results.get(p.number)?.message || 'Missing validation.'}`).join('\n') || 'PR is closed.';
+      await github.rest.checks.update({...args,check_run_id:id,status:'completed',conclusion:bad.length?'failure':'success',
+        output:{title:bad.length?'Stack policy failed':'Stack policy passed',summary}});
+      rows.push(summary);
+    }
+    await core.summary.addHeading('Stack policy').addRaw(rows.join('\n\n')).write();
+  } catch(error) {
+    // Revoke even successes already published during this run if a later snapshot/API fails.
+    for (const id of checks.values()) {
+      try { await github.rest.checks.update({...args,check_run_id:id,status:'completed',conclusion:'failure',
+        output:{title:'Stack validation could not complete',summary:String(error.message).slice(0,60000)}}); }
+      catch (updateError) { core.error(`Failed to revoke check ${id}: ${updateError.message}`); }
+    }
+    core.setFailed(error.message);
+  }
+}
+
+module.exports = {dependency, validate, run, codexReview};
