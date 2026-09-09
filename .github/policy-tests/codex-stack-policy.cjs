@@ -13,7 +13,7 @@ function dependency(body) {
 const CODEX_BOT = 'chatgpt-codex-connector[bot]';
 const SUMMARY_MARKER = '<!-- codex-pull-request-review-summary -->';
 function isReviewRequest(body) {
-  const clean = (body || '').replace(/<!--[\s\S]*?-->/g, '').replace(/```[\s\S]*?```/g, '').replace(/~~~[\s\S]*?~~~/g, '');
+  const clean = (body || '').replace(/<!--[\s\S]*?(?:-->|$)/g, '').replace(/```[\s\S]*?(?:```|$)/g, '').replace(/~~~[\s\S]*?(?:~~~|$)/g, '');
   return /^@codex\s+(?:security\s+)?review\b/im.test(clean);
 }
 function codexReview(comments, reactions, previous = {}) {
@@ -42,7 +42,7 @@ function codexReview(comments, reactions, previous = {}) {
     }
   }
   for (const request of requests) {
-    const clean = request.body.replace(/<!--[\s\S]*?-->/g, '').replace(/```[\s\S]*?```/g, '').replace(/~~~[\s\S]*?~~~/g, '');
+    const clean = request.body.replace(/<!--[\s\S]*?(?:-->|$)/g, '').replace(/```[\s\S]*?(?:```|$)/g, '').replace(/~~~[\s\S]*?(?:~~~|$)/g, '');
     for (const match of clean.matchAll(/^@codex\s+(security\s+)?review\b/gim))
       record(match[1] ? 'security' : 'code', Date.parse(request.updated_at || request.created_at));
   }
@@ -206,6 +206,18 @@ async function run({github, context, core}) {
       stacks:s.stacks.filter(s=>s.open).map(s=>({number:s.number,base:s.base,prs:s.pull_requests.map(p=>[p.number,p.state,p.head.sha])})).sort((a,b)=>a.number-b.number)});
   }
   try {
+    // Discussion and unaccepted commands do not invalidate unrelated PR checks.
+    if (context.eventName === 'issue_comment') {
+      const comment = context.payload.comment;
+      const oldBody = context.payload.changes?.body?.from || '';
+      const botSummary = comment?.user?.login === CODEX_BOT && comment.user.type === 'Bot' &&
+        (comment.body?.includes(SUMMARY_MARKER) || oldBody.includes(SUMMARY_MARKER));
+      if (!botSummary) {
+        if (comment?.user?.type !== 'User' || (!isReviewRequest(comment.body) && !isReviewRequest(oldBody))) return;
+        const {data} = await github.rest.repos.getCollaboratorPermissionLevel({...args, username:comment.user.login});
+        if (!['admin','maintain','write'].includes(data.permission)) return;
+      }
+    }
     // Invalidate old success before querying stacks or ancestors. Failed API calls leave failures.
     if (context.payload.pull_request?.head?.sha) await pending([context.payload.pull_request]);
     let open = await listOpen();

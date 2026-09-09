@@ -171,3 +171,16 @@ test('synchronize carries recorded active state from the preceding head',async()
  h.github.paginate=async(route,args)=>route===h.github.rest.checks.listForRef && args.ref==='oldsha' ? [{app:{slug:'github-actions'},output:{text:'codex-review-memory-v2:'+JSON.stringify({1:{seen:true,after:{code:Date.parse(at)}}})}}] : paginate(route,args);
  await run(h);assert.equal(h.failures.length,0);assert.equal(h.updates.at(-1).conclusion,'failure');
 });
+test('unterminated fenced and commented examples are not review requests',()=>{
+ for(const body of ['```\n@codex review','~~~\n@codex review','<!--\n@codex review'])
+  assert.equal(codexReview([{body,authorizedRequest:true,created_at:later}],[]).ok,true);
+});
+test('unrelated discussion does not invalidate PR checks',async()=>{
+ const h=harness();h.context.eventName='issue_comment';h.context.payload.comment={user:{login:'visitor',type:'User'},body:'Thanks for the update'};
+ await run(h);assert.equal(h.created.length,0);assert.equal(h.failures.length,0);
+});
+test('unauthorized commands do not invalidate PR checks',async()=>{
+ const h=harness();h.context.eventName='issue_comment';h.context.payload.comment={user:{login:'visitor',type:'User'},body:'@codex review'};
+ h.github.rest.repos.getCollaboratorPermissionLevel=async()=>({data:{permission:'read'}});
+ await run(h);assert.equal(h.created.length,0);assert.equal(h.failures.length,0);
+});
