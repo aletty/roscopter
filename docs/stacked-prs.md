@@ -48,7 +48,7 @@ GitHub may change its public-preview stack APIs. A failing validation must be in
 <!-- codex-review-gate:start -->
 ## Codex review completion
 
-The required `Stack policy` check blocks while Codex's authenticated summary reports a running, failed, or unknown review, while a new `@codex review` / `@codex security review` request awaits completion, or while an active bot eyes reaction has no later completion. Every code and security review must finish. Completed findings are advisory: maintainers may choose to ignore them. Retry a failed review; do not bypass an unfinished review.
+The required `Stack policy` check blocks while Codex's authenticated summary reports a running, failed, or unknown review, while a new `@codex review` / `@codex security review` request from someone with repository write access awaits completion, or while an active bot eyes reaction has no later completion. Every code and security review must finish. Completed findings are advisory: maintainers may choose to ignore them. Retry a failed review; do not bypass an unfinished review.
 
 PR and comment events update the check. Manually dispatch the controller if a legacy reaction-only review does not emit a summary event. GitHub event delivery is asynchronous, leaving a brief detection window when a new review starts. No review is required when none is requested or active. This does not require a fresh review of every push. Existing stack, CI, and review requirements still apply. The controller only reads GitHub metadata and never executes PR code.
 <!-- codex-review-gate:end -->

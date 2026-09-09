@@ -41,6 +41,10 @@ jobs:
             
             const CODEX_BOT = 'chatgpt-codex-connector[bot]';
             const SUMMARY_MARKER = '<!-- codex-pull-request-review-summary -->';
+            function isReviewRequest(body) {
+              const clean = (body || '').replace(/<!--[\s\S]*?-->/g, '').replace(/```[\s\S]*?```/g, '').replace(/~~~[\s\S]*?~~~/g, '');
+              return /^@codex\s+(?:security\s+)?review\b/im.test(clean);
+            }
             function codexReview(comments, reactions) {
               const summaries = comments.filter(c => c.user?.login === CODEX_BOT && c.user?.type === 'Bot' && c.body?.includes(SUMMARY_MARKER));
               // Read only the status column, never explanatory text or findings.
@@ -54,11 +58,11 @@ jobs:
                 }
               }
               const completedAt = Math.max(0, ...summaries.map(c => Date.parse(c.updated_at) || 0));
-              const requests = comments.filter(c => /^\s*@codex\s+(?:security\s+)?review\b/im.test(c.body || ''));
-              if (requests.some(c => (Date.parse(c.created_at) || Infinity) > completedAt))
+              const requests = comments.filter(c => c.authorizedRequest === true && isReviewRequest(c.body));
+              if (requests.some(c => (Date.parse(c.updated_at || c.created_at) || Infinity) >= completedAt))
                 return {ok:false, message:'A Codex review was requested; waiting for the bot completion summary.'};
               const eyes = reactions.filter(r => r.user?.login === CODEX_BOT && r.user?.type === 'Bot' && r.content === 'eyes');
-              if (eyes.some(r => !completedAt || (Date.parse(r.created_at) || Infinity) > completedAt))
+              if (eyes.some(r => !completedAt || (Date.parse(r.created_at) || Infinity) >= completedAt))
                 return {ok:false, message:'Codex is reviewing (eyes reaction); wait for completion.'};
               return {ok:true, message:summaries.length ? 'Codex review completed; findings are advisory.' : 'No active Codex review detected.'};
             }
@@ -163,9 +167,21 @@ jobs:
                   }
                 }
                 const codex = {};
+                const permissions = new Map();
                 for (const p of open) {
                   const comments = await github.paginate(github.rest.issues.listComments, {...args, issue_number:p.number, per_page:100});
+                  for (const comment of comments.filter(c => isReviewRequest(c.body) && c.user?.type === 'User')) {
+                    const username = comment.user.login;
+                    if (!permissions.has(username)) {
+                      const {data} = await github.rest.repos.getCollaboratorPermissionLevel({...args, username});
+                      permissions.set(username, ['admin','maintain','write'].includes(data.permission));
+                    }
+                    comment.authorizedRequest = permissions.get(username);
+                  }
                   const reactions = await github.paginate(github.rest.reactions.listForIssue, {...args, issue_number:p.number, per_page:100});
+                  for (const comment of comments.filter(c => c.reactions?.eyes > 0)) {
+                    reactions.push(...await github.paginate(github.rest.reactions.listForIssueComment, {...args, comment_id:comment.id, per_page:100}));
+                  }
                   codex[p.number] = codexReview(comments, reactions);
                 }
                 return {repository, defaultBranch:repositoryData.default_branch, pulls, stacks, ancestors:{}, codex};
@@ -199,11 +215,11 @@ jobs:
                   if (fingerprint(before) === fingerprint(after)) { stable=after; break; }
                 }
                 if (!stable) throw new Error('Dependency graph changed repeatedly during validation; rerun when stable.');
+                // Check once around the publication batch: O(N) review reads, not O(N squared).
+                const fresh = await snapshot(await listOpen());
+                if (fingerprint(stable) !== fingerprint(fresh)) throw new Error('PR metadata changed before publication; rerun required.');
                 const rows=[];
                 for (const [sha,id] of checks) {
-                  // Re-read all dependency metadata before issuing any success for this SHA.
-                  const fresh = await snapshot(await listOpen());
-                  if (fingerprint(stable) !== fingerprint(fresh)) throw new Error('PR metadata changed before publication; rerun required.');
                   const prs = stable.pulls.filter(p=>p.state==='open' && p.head.sha===sha);
                   const bad = prs.filter(p=>!results.get(p.number)?.ok);
                   const summary = prs.map(p=>`#${p.number}: ${results.get(p.number)?.message || 'Missing validation.'}`).join('\n') || 'PR is closed.';
@@ -211,6 +227,8 @@ jobs:
                     output:{title:bad.length?'Stack policy failed':'Stack policy passed',summary}});
                   rows.push(summary);
                 }
+                const published = await snapshot(await listOpen());
+                if (fingerprint(stable) !== fingerprint(published)) throw new Error('PR metadata changed during publication; revoking results.');
                 await core.summary.addHeading('Stack policy').addRaw(rows.join('\n\n')).write();
               } catch(error) {
                 // Revoke even successes already published during this run if a later snapshot/API fails.
