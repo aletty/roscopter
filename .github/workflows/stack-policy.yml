@@ -46,12 +46,12 @@ jobs:
               return /^@codex\s+(?:security\s+)?review\b/im.test(clean);
             }
             function codexReview(comments, reactions, previous = {}) {
-              const memory = {seen:!!previous.seen, after:{...previous.after}};
+              const memory = {seen:!!previous.seen, after:{...previous.after}, completed:{code:0,security:0,any:0,...previous.completed}};
               const summaries = comments.filter(c => c.user?.login === CODEX_BOT && c.user?.type === 'Bot' && c.body?.includes(SUMMARY_MARKER));
               const requests = comments.filter(c => c.authorizedRequest === true && isReviewRequest(c.body));
               const eyes = reactions.filter(r => r.user?.login === CODEX_BOT && r.user?.type === 'Bot' && r.content === 'eyes');
               memory.seen ||= !!(summaries.length || requests.length || eyes.length);
-              const completed = {code:0, security:0, any:0};
+              const completed = memory.completed;
               let problem = '';
               const record = (kind, time) => { memory.after[kind] = Math.max(memory.after[kind] || 0, time || Number.MAX_SAFE_INTEGER); };
               for (const summary of summaries) {
@@ -60,13 +60,14 @@ jobs:
                 for (const row of rows) {
                   const kind = /\*\*Security Review\*\*/i.test(row) ? 'security' : 'code';
                   const status = row.split('|')[2] || '';
-                  const timestamp = Date.parse(status.match(/datetime="([^"]+)"/)?.[1] || summary.updated_at) || 0;
+                  const timestamp = Date.parse(status.match(/datetime="([^"]+)"/)?.[1]) || 0;
+                  if (!timestamp) { problem = 'Codex review row has no valid completion/activity timestamp; waiting for a supported summary.'; continue; }
                   if (/\*\*Completed\*\*/i.test(status)) {
                     completed[kind] = Math.max(completed[kind], timestamp);
                     completed.any = Math.max(completed.any, timestamp);
                   } else {
                     record(kind, timestamp);
-                    problem = 'Codex review has not completed. Wait for its response; retry a failed review.';
+                    // Historical failed/running rows are superseded only by a later matching completion.
                   }
                 }
               }
@@ -76,11 +77,11 @@ jobs:
                   record(match[1] ? 'security' : 'code', Date.parse(request.updated_at || request.created_at));
               }
               for (const reaction of eyes) record('any', Date.parse(reaction.created_at));
-              if (!problem && memory.seen && !summaries.length)
+              if (!problem && memory.seen && !summaries.length && !completed.any)
                 problem = 'Codex review activity was recorded; its completion summary is missing. Deleting a marker does not cancel the gate.';
               if (!problem && Object.entries(memory.after).some(([kind,time]) => completed[kind] <= time))
                 problem = 'Waiting for a later completion of each requested or previously active Codex review.';
-              return {ok:!problem, message:problem || (summaries.length ? 'Codex review completed; findings are advisory.' : 'No active Codex review detected.'), memory};
+              return {ok:!problem, message:problem || (completed.any ? 'Codex review completed; findings are advisory.' : 'No active Codex review detected.'), memory};
             }
             
             function validate(snapshot) {
@@ -176,9 +177,11 @@ jobs:
                     if (check.app?.slug !== 'github-actions' || !check.output?.text?.startsWith(MEMORY_MARKER)) continue;
                     const saved = JSON.parse(check.output.text.slice(MEMORY_MARKER.length));
                     for (const [number,state] of Object.entries(saved)) {
-                      const old = reviewMemory[number] || {seen:false, after:{}};
+                      const old = reviewMemory[number] || {seen:false, after:{}, completed:{}};
+                      old.completed ||= {};
                       old.seen ||= state.seen;
                       for (const [kind,time] of Object.entries(state.after || {})) old.after[kind] = Math.max(old.after[kind] || 0, time);
+                      for (const [kind,time] of Object.entries(state.completed || {})) old.completed[kind] = Math.max(old.completed[kind] || 0, time);
                       reviewMemory[number] = old;
                     }
                   }
@@ -220,7 +223,7 @@ jobs:
                     comment.authorizedRequest = permissions.get(username);
                   }
                   const reactions = await github.paginate(github.rest.reactions.listForIssue, {...args, issue_number:p.number, per_page:100});
-                  for (const comment of comments.filter(c => c.reactions?.eyes > 0)) {
+                  for (const comment of comments.filter(c => c.id !== deleted?.id && c.reactions?.eyes > 0)) {
                     reactions.push(...await github.paginate(github.rest.reactions.listForIssueComment, {...args, comment_id:comment.id, per_page:100}));
                   }
                   codex[p.number] = codexReview(comments, reactions, reviewMemory[p.number]);

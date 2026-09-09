@@ -57,7 +57,7 @@ const {codexReview} = require('./codex-stack-policy.cjs');
 const bot={login:'chatgpt-codex-connector[bot]',type:'Bot'};
 const at='2026-09-09T01:00:00Z', later='2026-09-09T02:00:00Z';
 function summary(status='Completed', user=bot) {
- return {user,updated_at:at,body:`<!-- codex-pull-request-review-summary -->\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **${status}** | \`abc1234\` | PR opened |\nCodex reacts with eyes while Running.`};
+ return {user,updated_at:at,body:`<!-- codex-pull-request-review-summary -->\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **${status}** <relative-time datetime="${at}">time</relative-time> | \`abc1234\` | PR opened |\nCodex reacts with eyes while Running.`};
 }
 test('completed review passes regardless of findings or explanatory Running text',()=>assert.equal(codexReview([summary()],[]).ok,true));
 test('running, failed, cancelled, queued and unknown summaries block',()=>{
@@ -65,7 +65,7 @@ test('running, failed, cancelled, queued and unknown summaries block',()=>{
  const c=summary(); c.body='<!-- codex-pull-request-review-summary -->\nunknown format';assert.equal(codexReview([c],[]).ok,false);
 });
 test('all concurrent review types must finish',()=>{
- const c=summary();c.body+='\n| 🔒 **Security Review** | 🔄 **Running** | `abc1234` | PR opened |';assert.equal(codexReview([c],[]).ok,false);
+ const c=summary();c.body+='\n| 🔒 **Security Review** | 🔄 **Running** <relative-time datetime="2026-09-09T01:00:00Z">time</relative-time> | `abc1234` | PR opened |';assert.equal(codexReview([c],[]).ok,false);
 });
 test('human cannot spoof completion or active bot status',()=>{
  assert.equal(codexReview([summary('Running',{login:'aletty',type:'User'})],[]).ok,true);
@@ -74,7 +74,7 @@ test('human cannot spoof completion or active bot status',()=>{
 test('eyes-only review blocks and completion supersedes earlier eyes',()=>{
  const r={user:bot,content:'eyes',created_at:at};assert.equal(codexReview([],[r]).ok,false);
  assert.equal(codexReview([summary()],[r]).ok,false);
- const done=summary();done.updated_at=later;assert.equal(codexReview([done],[r]).ok,true);
+ const done=summary();done.updated_at=later;done.body=done.body.replaceAll(at,later);assert.equal(codexReview([done],[r]).ok,true);
  assert.equal(codexReview([summary()],[{...r,created_at:later}]).ok,false);
 });
 test('new manual review requests block even after previous completion',()=>{
@@ -90,7 +90,7 @@ test('active Codex review blocks entire native stack',()=>{
 test('review activity changing during publication cannot pass',async()=>{
  const h=harness();const paginate=h.github.paginate;let n=0;
  h.github.paginate=async(route,args)=>route===h.github.rest.issues.listComments ? [summary(++n%2?'Completed':'Running')] : paginate(route,args);
- await run(h);assert.ok(h.updates.every(u=>u.conclusion==='failure'));assert.equal(h.failures.length,1);
+ await run(h);assert.ok(h.updates.every(u=>u.conclusion==='failure'));assert.equal(h.updates.at(-1).conclusion,'failure');
 });
 
 test('untrusted, quoted and fenced requests do not block',()=>{
@@ -137,20 +137,20 @@ test('controller detects authenticated eyes on triggering comments',async()=>{
  await run(h);assert.equal(h.failures.length,0);assert.equal(h.updates.at(-1).conclusion,'failure');
 });
 test('code completion cannot satisfy a security review request',()=>{
- const c=summary();c.updated_at=later;
+ const c=summary();c.updated_at=later;c.body=c.body.replaceAll(at,later);
  const request={body:'@codex security review',created_at:at,authorizedRequest:true};
  assert.equal(codexReview([c,request],[]).ok,false);
- c.body+='\n| 🔒 **Security Review** | ✅ **Completed** | `abc1234` | manual |';
+ c.body+='\n| 🔒 **Security Review** | ✅ **Completed** <relative-time datetime="2026-09-09T02:00:00Z">time</relative-time> | `abc1234` | manual |';
  assert.equal(codexReview([c,request],[]).ok,true);
 });
 test('row completion time wins over a later unrelated summary edit',()=>{
- const c=summary();c.updated_at=later;c.body=c.body.replace('**Completed**','**Completed** <relative-time datetime="2026-09-09T00:59:59Z">old</relative-time>');
+ const c=summary();c.updated_at=later;c.body=c.body.replaceAll(at,later);c.body=c.body.replace('**Completed**','**Completed** <relative-time datetime="2026-09-09T00:59:59Z">old</relative-time>');
  assert.equal(codexReview([c,{body:'@codex review',created_at:at,authorizedRequest:true}],[]).ok,false);
 });
 test('deleting running summary preserves the wait until a later completion',()=>{
  const first=codexReview([summary('Running')],[]);
  assert.equal(codexReview([],[],first.memory).ok,false);
- const done=summary();done.updated_at=later;
+ const done=summary();done.updated_at=later;done.body=done.body.replaceAll(at,later);
  assert.equal(codexReview([done],[],first.memory).ok,true);
 });
 test('deleting an accepted request does not let an older completion pass',()=>{
@@ -183,4 +183,28 @@ test('unauthorized commands do not invalidate PR checks',async()=>{
  const h=harness();h.context.eventName='issue_comment';h.context.payload.comment={user:{login:'visitor',type:'User'},body:'@codex review'};
  h.github.rest.repos.getCollaboratorPermissionLevel=async()=>({data:{permission:'read'}});
  await run(h);assert.equal(h.created.length,0);assert.equal(h.failures.length,0);
+});
+test('deleted requests retain state without fetching their removed reactions',async()=>{
+ const h=harness();h.context.eventName='issue_comment';h.context.payload.action='deleted';h.context.payload.issue={number:1};
+ h.context.payload.comment={id:123,user:{login:'aletty',type:'User'},body:'@codex review',created_at:later,reactions:{eyes:1}};
+ h.github.rest.repos.getCollaboratorPermissionLevel=async()=>({data:{permission:'write'}});
+ const paginate=h.github.paginate;
+ h.github.rest.reactions.listForIssueComment=Symbol('deletedCommentReactions');
+ h.github.paginate=async(route,args)=>{if(route===h.github.rest.reactions.listForIssueComment)throw new Error('deleted comment cannot be fetched');return paginate(route,args);};
+ await run(h);assert.equal(h.failures.length,0);assert.equal(h.updates.at(-1).conclusion,'failure');
+ assert.ok(h.updates.at(-1).output.text.includes(String(Date.parse(later))));
+});
+test('remembered completion survives summary deletion',()=>{
+ const first=codexReview([summary()],[]);
+ assert.equal(codexReview([],[],first.memory).ok,true);
+});
+test('later completion supersedes historical failed and running summaries',()=>{
+ for(const status of ['Failed','Running']) {
+  const done=summary();done.body=done.body.replaceAll(at,later);
+  assert.equal(codexReview([summary(status),done],[]).ok,true);
+ }
+});
+test('summary edit time cannot substitute for missing per-row timestamps',()=>{
+ const c=summary();c.body=c.body.replace(/ <relative-time[\s\S]*?<\/relative-time>/,'');
+ assert.equal(codexReview([c],[]).ok,false);
 });
