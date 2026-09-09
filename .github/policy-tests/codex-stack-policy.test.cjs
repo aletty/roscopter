@@ -41,7 +41,7 @@ function harness({failure=false,change=false,shared=false}={}) {
   const rest={pulls:{list:Symbol('list'),get:async()=>{throw new Error('not expected')}},
     issues:{listComments:Symbol('comments')},reactions:{listForIssue:Symbol('reactions')},
     repos:{get:async()=>({data:{default_branch:'main'}})},
-    checks:{create:async p=>{created.push(p);return {data:{id:created.length}}},update:async p=>{updates.push(p);return {data:p}}}};
+    checks:{listForRef:Symbol('listChecks'),create:async p=>{created.push(p);return {data:{id:created.length}}},update:async p=>{updates.push(p);return {data:p}}}};
   const github={rest,paginate:async route=>{
     if(route===rest.pulls.list){reads++;const result=structuredClone(pulls);if(change&&reads>1)result[0].body+='\n'+reads;return result;}
     if(failure)throw new Error('GitHub unavailable');return [];
@@ -78,7 +78,7 @@ test('eyes-only review blocks and completion supersedes earlier eyes',()=>{
  assert.equal(codexReview([summary()],[{...r,created_at:later}]).ok,false);
 });
 test('new manual review requests block even after previous completion',()=>{
- for(const body of ['@codex review','@codex security review']) {
+ for(const body of ['@codex review']) {
   const r={body,created_at:later,authorizedRequest:true};assert.equal(codexReview([summary(),r],[]).ok,false);
   r.created_at='2026-09-09T00:59:59Z';assert.equal(codexReview([summary(),r],[]).ok,true);
  }
@@ -134,5 +134,40 @@ test('controller detects authenticated eyes on triggering comments',async()=>{
   if(route===h.github.rest.reactions.listForIssueComment)return [{user:bot,content:'eyes',created_at:at}];
   return paginate(route,args);
  };
+ await run(h);assert.equal(h.failures.length,0);assert.equal(h.updates.at(-1).conclusion,'failure');
+});
+test('code completion cannot satisfy a security review request',()=>{
+ const c=summary();c.updated_at=later;
+ const request={body:'@codex security review',created_at:at,authorizedRequest:true};
+ assert.equal(codexReview([c,request],[]).ok,false);
+ c.body+='\n| 🔒 **Security Review** | ✅ **Completed** | `abc1234` | manual |';
+ assert.equal(codexReview([c,request],[]).ok,true);
+});
+test('row completion time wins over a later unrelated summary edit',()=>{
+ const c=summary();c.updated_at=later;c.body=c.body.replace('**Completed**','**Completed** <relative-time datetime="2026-09-09T00:59:59Z">old</relative-time>');
+ assert.equal(codexReview([c,{body:'@codex review',created_at:at,authorizedRequest:true}],[]).ok,false);
+});
+test('deleting running summary preserves the wait until a later completion',()=>{
+ const first=codexReview([summary('Running')],[]);
+ assert.equal(codexReview([],[],first.memory).ok,false);
+ const done=summary();done.updated_at=later;
+ assert.equal(codexReview([done],[],first.memory).ok,true);
+});
+test('deleting an accepted request does not let an older completion pass',()=>{
+ const first=codexReview([summary(),{body:'@codex review',created_at:later,authorizedRequest:true}],[]);
+ assert.equal(codexReview([summary()],[],first.memory).ok,false);
+});
+test('controller persists and reloads active state from trusted check output',async()=>{
+ const h=harness();const paginate=h.github.paginate;
+ h.github.paginate=async(route,args)=>route===h.github.rest.issues.listComments ? [summary('Running')] : paginate(route,args);
+ await run(h);
+ const saved=h.updates.at(-1);
+ const next=harness();const nextPaginate=next.github.paginate;
+ next.github.paginate=async(route,args)=>route===next.github.rest.checks.listForRef ? [{app:{slug:'github-actions'},output:saved.output}] : nextPaginate(route,args);
+ await run(next);assert.equal(next.failures.length,0);assert.equal(next.updates.at(-1).conclusion,'failure');
+});
+test('synchronize carries recorded active state from the preceding head',async()=>{
+ const h=harness();h.context.payload.before='oldsha';const paginate=h.github.paginate;
+ h.github.paginate=async(route,args)=>route===h.github.rest.checks.listForRef && args.ref==='oldsha' ? [{app:{slug:'github-actions'},output:{text:'codex-review-memory-v2:'+JSON.stringify({1:{seen:true,after:{code:Date.parse(at)}}})}}] : paginate(route,args);
  await run(h);assert.equal(h.failures.length,0);assert.equal(h.updates.at(-1).conclusion,'failure');
 });

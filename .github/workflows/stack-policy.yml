@@ -45,26 +45,42 @@ jobs:
               const clean = (body || '').replace(/<!--[\s\S]*?-->/g, '').replace(/```[\s\S]*?```/g, '').replace(/~~~[\s\S]*?~~~/g, '');
               return /^@codex\s+(?:security\s+)?review\b/im.test(clean);
             }
-            function codexReview(comments, reactions) {
+            function codexReview(comments, reactions, previous = {}) {
+              const memory = {seen:!!previous.seen, after:{...previous.after}};
               const summaries = comments.filter(c => c.user?.login === CODEX_BOT && c.user?.type === 'Bot' && c.body?.includes(SUMMARY_MARKER));
-              // Read only the status column, never explanatory text or findings.
+              const requests = comments.filter(c => c.authorizedRequest === true && isReviewRequest(c.body));
+              const eyes = reactions.filter(r => r.user?.login === CODEX_BOT && r.user?.type === 'Bot' && r.content === 'eyes');
+              memory.seen ||= !!(summaries.length || requests.length || eyes.length);
+              const completed = {code:0, security:0, any:0};
+              let problem = '';
+              const record = (kind, time) => { memory.after[kind] = Math.max(memory.after[kind] || 0, time || Number.MAX_SAFE_INTEGER); };
               for (const summary of summaries) {
                 const rows = summary.body.split(/\r?\n/).filter(line => /^\|/.test(line) && /\*\*(?:Code Review|Security Review)\*\*/i.test(line));
-                if (!rows.length) return {ok:false, message:'Codex review status is unrecognized; wait for a valid completion summary.'};
+                if (!rows.length) problem = 'Codex review status is unrecognized; wait for a valid completion summary.';
                 for (const row of rows) {
+                  const kind = /\*\*Security Review\*\*/i.test(row) ? 'security' : 'code';
                   const status = row.split('|')[2] || '';
-                  if (!/\*\*Completed\*\*/i.test(status))
-                    return {ok:false, message:'Codex review has not completed. Wait for its response; retry a failed review.'};
+                  const timestamp = Date.parse(status.match(/datetime="([^"]+)"/)?.[1] || summary.updated_at) || 0;
+                  if (/\*\*Completed\*\*/i.test(status)) {
+                    completed[kind] = Math.max(completed[kind], timestamp);
+                    completed.any = Math.max(completed.any, timestamp);
+                  } else {
+                    record(kind, timestamp);
+                    problem = 'Codex review has not completed. Wait for its response; retry a failed review.';
+                  }
                 }
               }
-              const completedAt = Math.max(0, ...summaries.map(c => Date.parse(c.updated_at) || 0));
-              const requests = comments.filter(c => c.authorizedRequest === true && isReviewRequest(c.body));
-              if (requests.some(c => (Date.parse(c.updated_at || c.created_at) || Infinity) >= completedAt))
-                return {ok:false, message:'A Codex review was requested; waiting for the bot completion summary.'};
-              const eyes = reactions.filter(r => r.user?.login === CODEX_BOT && r.user?.type === 'Bot' && r.content === 'eyes');
-              if (eyes.some(r => !completedAt || (Date.parse(r.created_at) || Infinity) >= completedAt))
-                return {ok:false, message:'Codex is reviewing (eyes reaction); wait for completion.'};
-              return {ok:true, message:summaries.length ? 'Codex review completed; findings are advisory.' : 'No active Codex review detected.'};
+              for (const request of requests) {
+                const clean = request.body.replace(/<!--[\s\S]*?-->/g, '').replace(/```[\s\S]*?```/g, '').replace(/~~~[\s\S]*?~~~/g, '');
+                for (const match of clean.matchAll(/^@codex\s+(security\s+)?review\b/gim))
+                  record(match[1] ? 'security' : 'code', Date.parse(request.updated_at || request.created_at));
+              }
+              for (const reaction of eyes) record('any', Date.parse(reaction.created_at));
+              if (!problem && memory.seen && !summaries.length)
+                problem = 'Codex review activity was recorded; its completion summary is missing. Deleting a marker does not cancel the gate.';
+              if (!problem && Object.entries(memory.after).some(([kind,time]) => completed[kind] <= time))
+                problem = 'Waiting for a later completion of each requested or previously active Codex review.';
+              return {ok:!problem, message:problem || (summaries.length ? 'Codex review completed; findings are advisory.' : 'No active Codex review detected.'), memory};
             }
             
             function validate(snapshot) {
@@ -140,6 +156,8 @@ jobs:
               const headers = {'X-GitHub-Api-Version':'2026-03-10'};
               const args = {owner, repo, headers};
               const checks = new Map();
+              const reviewMemory = {};
+              const MEMORY_MARKER = "codex-review-memory-v2:";
               const details_url = `${context.serverUrl}/${repository}/actions/runs/${context.runId}`;
               async function listOpen() { return github.paginate(github.rest.pulls.list, {...args, state:'open', per_page:100}); }
               async function pending(pulls) {
@@ -148,6 +166,26 @@ jobs:
                     status:'in_progress', details_url, output:{title:'Validating current dependency graph', summary:'Validation is pending; no PR code is executed.'}});
                   checks.set(p.head.sha, data.id);
                 }
+              }
+              async function loadMemory(open) {
+                const refs = new Set(open.map(p => p.head.sha));
+                if (context.payload.before) refs.add(context.payload.before);
+                for (const ref of refs) {
+                  const runs = await github.paginate(github.rest.checks.listForRef, {...args, ref, check_name:'Stack policy', filter:'all', per_page:100});
+                  for (const check of runs) {
+                    if (check.app?.slug !== 'github-actions' || !check.output?.text?.startsWith(MEMORY_MARKER)) continue;
+                    const saved = JSON.parse(check.output.text.slice(MEMORY_MARKER.length));
+                    for (const [number,state] of Object.entries(saved)) {
+                      const old = reviewMemory[number] || {seen:false, after:{}};
+                      old.seen ||= state.seen;
+                      for (const [kind,time] of Object.entries(state.after || {})) old.after[kind] = Math.max(old.after[kind] || 0, time);
+                      reviewMemory[number] = old;
+                    }
+                  }
+                }
+              }
+              function memoryText(prs, snapshot) {
+                return MEMORY_MARKER + JSON.stringify(Object.fromEntries(prs.map(p => [p.number, snapshot?.codex[p.number]?.memory || reviewMemory[p.number] || {}])));
               }
               async function snapshot(open) {
                 const {data: repositoryData} = await github.rest.repos.get(args);
@@ -170,6 +208,9 @@ jobs:
                 const permissions = new Map();
                 for (const p of open) {
                   const comments = await github.paginate(github.rest.issues.listComments, {...args, issue_number:p.number, per_page:100});
+                  const deleted = context.eventName === 'issue_comment' && context.payload.action === 'deleted' && context.payload.issue?.number === p.number ? context.payload.comment : null;
+                  // Preserve a deleted command/active bot marker from the trusted event payload.
+                  if (deleted) comments.push(deleted);
                   for (const comment of comments.filter(c => isReviewRequest(c.body) && c.user?.type === 'User')) {
                     const username = comment.user.login;
                     if (!permissions.has(username)) {
@@ -182,7 +223,8 @@ jobs:
                   for (const comment of comments.filter(c => c.reactions?.eyes > 0)) {
                     reactions.push(...await github.paginate(github.rest.reactions.listForIssueComment, {...args, comment_id:comment.id, per_page:100}));
                   }
-                  codex[p.number] = codexReview(comments, reactions);
+                  codex[p.number] = codexReview(comments, reactions, reviewMemory[p.number]);
+                  reviewMemory[p.number] = codex[p.number].memory;
                 }
                 return {repository, defaultBranch:repositoryData.default_branch, pulls, stacks, ancestors:{}, codex};
               }
@@ -197,6 +239,7 @@ jobs:
                 if (context.payload.pull_request?.head?.sha) await pending([context.payload.pull_request]);
                 let open = await listOpen();
                 await pending(open);
+                await loadMemory(open);
                 let stable, results;
                 for (let attempt=0; attempt<3; attempt++) {
                   const before = await snapshot(open);
@@ -224,9 +267,10 @@ jobs:
                   const bad = prs.filter(p=>!results.get(p.number)?.ok);
                   const summary = prs.map(p=>`#${p.number}: ${results.get(p.number)?.message || 'Missing validation.'}`).join('\n') || 'PR is closed.';
                   await github.rest.checks.update({...args,check_run_id:id,status:'completed',conclusion:bad.length?'failure':'success',
-                    output:{title:bad.length?'Stack policy failed':'Stack policy passed',summary}});
+                    output:{title:bad.length?'Stack policy failed':'Stack policy passed',summary,text:memoryText(prs,stable)}});
                   rows.push(summary);
                 }
+                for (const p of stable.pulls.filter(p=>p.state==='open')) reviewMemory[p.number] = stable.codex[p.number].memory;
                 const published = await snapshot(await listOpen());
                 if (fingerprint(stable) !== fingerprint(published)) throw new Error('PR metadata changed during publication; revoking results.');
                 await core.summary.addHeading('Stack policy').addRaw(rows.join('\n\n')).write();
@@ -234,7 +278,7 @@ jobs:
                 // Revoke even successes already published during this run if a later snapshot/API fails.
                 for (const id of checks.values()) {
                   try { await github.rest.checks.update({...args,check_run_id:id,status:'completed',conclusion:'failure',
-                    output:{title:'Stack validation could not complete',summary:String(error.message).slice(0,60000)}}); }
+                    output:{title:'Stack validation could not complete',summary:String(error.message).slice(0,60000),text:MEMORY_MARKER+JSON.stringify(reviewMemory)}}); }
                   catch (updateError) { core.error(`Failed to revoke check ${id}: ${updateError.message}`); }
                 }
                 core.setFailed(error.message);
